@@ -2,7 +2,7 @@
 
 A real-time talent tracker overlay for [Deepwoken](https://deepwoken.co).  
 Load your build from deepwoken.co/builder, then let the overlay watch which talent cards appear on screen and highlight the ones you still need.
-
+[VirusTotal](https://www.virustotal.com/gui/file/c0f2d83ba643360b7d6038f87a979b1ddeb86a2fce64be9a57d9ca91475dd3d7)
 ---
 
 ## Features
