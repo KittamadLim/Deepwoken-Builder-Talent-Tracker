@@ -1,0 +1,26 @@
+{
+  "ocr_regions": [
+    {"x": 283, "y": 235, "w": 158, "h": 42},
+    {"x": 451, "y": 235, "w": 158, "h": 42},
+    {"x": 618, "y": 235, "w": 158, "h": 42},
+    {"x": 786, "y": 235, "w": 158, "h": 42},
+    {"x": 954, "y": 235, "w": 158, "h": 42}
+  ],
+  "num_cards": 5,
+  "name_strip_region": null,
+  "talents_panel_region": {"x": 1060, "y": 100, "w": 300, "h": 650},
+  "ocr_interval_ms": 1000,
+  "fuzzy_threshold": 72,
+  "owned_fuzzy_threshold": 60,
+  "card_highlight_above": 30,
+  "card_highlight_below": 185,
+  "debug_images": false,
+  "debug_max_files": 20,
+  "debug_zorder": false,
+  "hotkey_toggle": "F6",
+  "hotkey_scan_owned": "F7",
+  "hotkey_diag": "F8",
+  "hotkey_reset_owned": "F9",
+  "known_owned_talents": [],
+  "last_url": ""
+}

@@ -1,0 +1,25 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ----- Build artifacts -----
+dist/
+build/
+*.spec.bak
+
+# ----- Runtime files -----
+overlay.log
+debug/
+
+# ----- Backup files -----
+*.bak
+*.orig
+
+# ----- IDE / OS -----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
