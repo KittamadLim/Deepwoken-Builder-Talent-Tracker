@@ -21,6 +21,7 @@ Load your build from deepwoken.co/builder, then let the overlay watch which tale
 
 > **Requirements:**
 > - Windows 10/11 (64-bit)
+> - A CPU with AVX2 support (most CPUs from 2013 onwards — Intel Haswell / AMD Excavator and newer)
 > - [Visual C++ 2015-2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) — required for the OCR engine. Most PCs already have this; install it if the overlay logs a DLL error on startup.
 
 ### Step 1 — Download

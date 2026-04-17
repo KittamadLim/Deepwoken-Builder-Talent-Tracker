@@ -116,6 +116,14 @@ a = Analysis(
 
 # ── Post-analysis cleanup: strip known-bloated binaries ──────────────────
 _strip_dlls = {s.lower() for s in [
+    # VC++ runtime DLLs — EXCLUDE from bundle so the system-installed
+    # Visual C++ 2015-2022 Redistributable is used instead.
+    # Bundling these causes version conflicts between copies shipped by
+    # PyQt5, onnxruntime, and Python itself (different sizes/versions),
+    # which makes onnxruntime fail on some machines.
+    "msvcp140.dll", "msvcp140_1.dll",
+    "vcruntime140.dll", "vcruntime140_1.dll",
+    "concrt140.dll",
     # Software OpenGL / DirectX — overlay doesn't need 3D rendering
     "opengl32sw.dll", "d3dcompiler_47.dll", "libGLESv2.dll", "libEGL.dll",
     # Qt modules we excluded above (hooks may still drag in the DLLs via deps)
@@ -140,6 +148,9 @@ _strip_dlls = {s.lower() for s in [
 def _should_keep_binary(name):
     base = os.path.basename(name).lower()
     if base in _strip_dlls:
+        return False
+    # Also strip hash-suffixed VC++ duplicates (e.g. msvcp140-a4c2229b....dll)
+    if base.startswith(("msvcp140-", "vcruntime140-", "concrt140-")):
         return False
     # OpenCV ships a 27 MB ffmpeg DLL we don't use (no video capture)
     if "opencv_videoio_ffmpeg" in base:

@@ -82,7 +82,15 @@ def _get_rapid_ocr() -> object | None:
         log.info("RapidOCR engine loaded (ONNX-based, no subprocess)")
     except Exception as exc:
         _rapid_available = False
-        log.info("RapidOCR not available (%s) — falling back to Tesseract", exc)
+        exc_str = str(exc)
+        log.info("RapidOCR not available (%s) — falling back to Tesseract", exc_str)
+        if "DLL" in exc_str or "onnxruntime" in exc_str:
+            log.warning(
+                "This usually means your CPU does not support AVX2 instructions "
+                "(required by onnxruntime 1.17+), or the Visual C++ 2015-2022 "
+                "Redistributable (x64) is not installed. "
+                "Download it from: https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            )
     return _rapid_engine
 
 
