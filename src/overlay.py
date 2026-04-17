@@ -702,6 +702,23 @@ class OverlayWindow(QWidget):
         reset_row.addWidget(self._debug_btn)
         root.addLayout(reset_row)
 
+        # -------- Row 4: capture visibility toggle --------
+        capture_row = QHBoxLayout()
+        self._capture_hidden = True  # will be set True after show()
+        self._capture_btn = QPushButton("👁 Hidden from capture")
+        self._capture_btn.setToolTip(
+            "Toggle whether OBS / screen-capture can see this overlay.\n"
+            "Hidden = OCR works correctly but OBS won't show it.\n"
+            "Visible = OBS can record it but OCR may see its own UI."
+        )
+        self._capture_btn.setStyleSheet(
+            "background-color:#2a1a1a; color:#ff8866;"
+            " border:1px solid #664444; border-radius:4px; padding:4px 10px; font-size:11px;"
+        )
+        self._capture_btn.clicked.connect(self._toggle_capture_visibility)
+        capture_row.addWidget(self._capture_btn)
+        root.addLayout(capture_row)
+
         self.adjustSize()
         self.move(50, 50)
         self.show()
@@ -859,6 +876,33 @@ class OverlayWindow(QWidget):
             if self._card_highlight:
                 self._card_highlight.clear_debug()
         log.info("debug_ocr_highlight set to %s", enabled)
+
+    def _toggle_capture_visibility(self) -> None:
+        """Toggle WDA_EXCLUDEFROMCAPTURE so OBS/screen-capture can see the overlay."""
+        try:
+            hwnd = int(self.winId())
+            if self._capture_hidden:
+                # Remove capture exclusion — overlay becomes visible to OBS
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000000)
+                self._capture_hidden = False
+                self._capture_btn.setText("👁 Visible to capture")
+                self._capture_btn.setStyleSheet(
+                    "background-color:#1a2a1a; color:#66ff88;"
+                    " border:1px solid #446644; border-radius:4px; padding:4px 10px; font-size:11px;"
+                )
+                log.info("Capture visibility: ON (OBS can see overlay)")
+            else:
+                # Re-apply capture exclusion — overlay hidden from OBS again
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+                self._capture_hidden = True
+                self._capture_btn.setText("👁 Hidden from capture")
+                self._capture_btn.setStyleSheet(
+                    "background-color:#2a1a1a; color:#ff8866;"
+                    " border:1px solid #664444; border-radius:4px; padding:4px 10px; font-size:11px;"
+                )
+                log.info("Capture visibility: OFF (overlay hidden from OBS)")
+        except Exception as exc:
+            log.warning("Failed to toggle capture visibility: %s", exc)
 
     @pyqtSlot(str)
     def mark_talent_picked(self, talent: str) -> None:
