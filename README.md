@@ -12,73 +12,53 @@ Load your build from deepwoken.co/builder, then let the overlay watch which tale
 - One-shot owned-panel scan (F7) reads your character's talent list automatically
 - Click a highlighted card to instantly mark the talent as owned
 - Stat priority order shown for pre-shrine and post-shrine phases
-- Fast in-process OCR via RapidOCR (ONNX) with Tesseract as fallback
+- Fast in-process OCR via RapidOCR (ONNX) — no external tools needed
 
 ---
 
-## Option A — Run the pre-built .exe
+## Quick Start — Pre-built .exe (plug & play)
 
-> **Requirements:** Windows 10/11 (64-bit) · Visual C++ 2022 Redistributable ([download](https://aka.ms/vs/17/release/vc_redist.x64.exe))
+> **Requirements:** Windows 10/11 (64-bit). No Python or extra installs needed.
 
-1. Download the latest release ZIP from the [Releases](../../releases) page.
-2. Extract the entire `DeepwokenOverlay` folder anywhere (e.g. `Desktop\DeepwokenOverlay\`).
-3. Right-click `DeepwokenOverlay.exe` → **Run as Administrator** (required for global hotkeys).
-4. A dialog appears — paste your build URL and click **Load Build**.
+### Step 1 — Download
 
-> **Note:** The .exe bundles RapidOCR for fast OCR.  
-> If you want Tesseract as a fallback, install it separately (see below) and add it to PATH.
+Download the latest release ZIP from the [Releases](../../releases) page and extract the entire `DeepwokenOverlay` folder anywhere (Desktop, Documents, etc.).
 
----
+### Step 2 — Launch
 
-## Option B — Run from source
+Right-click **`DeepwokenOverlay.exe`** → **Run as Administrator**.  
+*(Administrator is required for the global hotkeys to work.)*
 
-### Prerequisites
+### Step 3 — Load your build
 
-| Requirement | Version | Notes |
-|---|---|---|
-| Python | 3.11 + | [python.org](https://www.python.org/downloads/) |
-| Tesseract-OCR | 5.x | Optional — only needed if RapidOCR fails |
+A dialog appears on first launch. Paste your deepwoken.co builder URL, e.g.:  
+`https://deepwoken.co/builder?id=XXXXXXXX`  
+Click **Load Build**. The overlay appears with your talent list.
 
-#### Installing Tesseract (optional fallback)
+### Step 4 — Pick the card area
 
-1. Download the Windows installer from [UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki).
-2. Run the installer — accept the default path (`C:\Program Files\Tesseract-OCR\`).
-3. The overlay finds Tesseract automatically at that default path; no PATH change needed.
+1. Open the in-game talent card selection screen (where you choose new talents).
+2. In the overlay, click **⚙ Settings**.
+3. Under **Card Auto-Detect ★ recommended**, click **📌 Pick Card Area**.
+4. Drag a rectangle that covers **all talent cards** on screen — their full height from the top banner to the bottom edge. The detector automatically finds each card.
+5. Click **OK** to save.
 
-### Install Python dependencies
+### Step 5 — Pick the owned-talents panel
 
-Open a terminal in the project folder and run:
+1. Open your in-game talent list (the right-side panel showing all your talents).
+2. In Settings → **Owned Talents Panel**, click **📌 Pick on Screen**.
+3. Drag around the talent list panel.
+4. Click **OK** to save.
 
-```powershell
-python -m pip install -r requirements.txt
-```
+### Step 6 — Start scanning
 
-This installs: PyQt5, OpenCV, RapidOCR (ONNX), pytesseract, rapidfuzz, mss, keyboard, requests, and numpy.
+- Press **F6** to toggle the continuous card scanner on/off.
+- Press **F7** to do a one-shot scan of your owned talents panel.
+- Cards you still need will be highlighted with colored borders.
+- Click a highlighted card to mark that talent as owned.
 
-### Run
-
-```powershell
-# Run as Administrator for global hotkeys (F6/F7/F8/F9)
-python main.py
-```
-
-A dialog appears — paste your build URL and click **Load Build**.
-
----
-
-## First-time setup — Calibrating capture regions
-
-The overlay needs to know where on your screen the talent cards and the owned-talents panel appear.  
-These regions depend on your resolution and where the game window is positioned.
-
-1. Launch the overlay and load a build.
-2. Click **⚙ Settings** in the overlay.
-3. For each **Card Region**, click **📌 Pick on Screen**, then drag a box over that card's name banner.
-4. For the **Owned Talents Panel**, pick the right-side panel that lists all your talents in-game.
-5. *(Optional)* If you prefer speed over per-card accuracy, pick a **Card Name Strip** spanning all cards at once — this runs a single OCR call instead of one per card.
-6. Click **OK** to save.
-
-Regions are saved in `config.json` and survive restarts.
+> Regions are saved in `config.json` and persist across restarts.  
+> You only need to calibrate once per monitor resolution.
 
 ---
 
@@ -106,16 +86,37 @@ Hotkeys can be changed in `config.json` (`hotkey_toggle`, `hotkey_scan_owned`, `
 
 ---
 
-## Building the .exe yourself
+## Run from source (for development)
 
-Requires the source dependencies plus PyInstaller:
+### Prerequisites
+
+| Requirement | Version | Notes |
+|---|---|---|
+| Python | 3.11 + | [python.org](https://www.python.org/downloads/) |
+
+### Install dependencies
 
 ```powershell
-# From the project folder, double-click or run:
+python -m pip install -r requirements.txt
+```
+
+### Run
+
+```powershell
+# Must run as Administrator for global hotkeys
+python main.py
+```
+
+---
+
+## Building the .exe yourself
+
+```powershell
+# From the project folder:
 build.bat
 ```
 
-Output is in `dist\DeepwokenOverlay\`.  Distribute the entire folder — the `.exe` alone won't work without the DLLs next to it.
+Output is in `dist\DeepwokenOverlay\`. Distribute the entire folder — the `.exe` needs the DLLs next to it.
 
 ---
 
@@ -126,13 +127,13 @@ deepwoken-builder-overlay/
 ├── src/                        # All Python source modules
 │   ├── api.py                  # Deepwoken build API client
 │   ├── highlight_overlay.py    # Transparent card-highlight window
-│   ├── ocr.py                  # RapidOCR / Tesseract scanner threads
+│   ├── ocr.py                  # RapidOCR scanner + card detection
 │   ├── optimizer.py            # Stat priority calculator
 │   ├── overlay.py              # Main overlay UI + settings dialog
 │   ├── region_picker.py        # Screen-region selector tool
 │   └── utils.py                # Config load/save, logging setup
 ├── main.py                     # Entry point
-├── config.json                 # Default settings (edit via ⚙ Settings)
+├── config.json                 # User settings (edit via ⚙ Settings)
 ├── requirements.txt
 ├── DeepwokenOverlay.spec       # PyInstaller build spec
 ├── build.bat                   # One-click build script
@@ -147,16 +148,15 @@ deepwoken-builder-overlay/
 Install the [Visual C++ 2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
 **Global hotkeys (F6/F7) don't work**  
-The `keyboard` library requires Administrator privileges on Windows. Right-click the `.exe` (or your terminal) → **Run as Administrator**.
+The `keyboard` library requires Administrator privileges. Right-click the `.exe` → **Run as Administrator**.
 
 **OCR misses talent names / poor accuracy**  
-- Open Settings and re-pick your card regions more tightly around the name banners.
-- Try enabling the **Card Name Strip** region for better multi-card accuracy.
-- Check `debug/` folder — enable `"debug_images": true` in `config.json` to save pre-processed OCR images for inspection.
-- Lower `fuzzy_threshold` in Settings if too many near-matches are being discarded (default: 72).
+- Re-pick the card area in Settings — make sure it covers the full card height.
+- Enable `"debug_images": true` in `config.json` and check the `debug/` folder for preprocessed OCR images.
+- Lower `fuzzy_threshold` in Settings if too many near-matches are discarded (default: 72).
 
 **Overlay appears behind the game**  
-Click **🔍 Diag** in the overlay and check the Z-order report, or press F8 and open `overlay.log`.
+Press **F8** and check `overlay.log` for the Z-order diagnostics report.
 
 **Build data not loading**  
 Ensure you copied the full URL including the `?id=` parameter, e.g.:  

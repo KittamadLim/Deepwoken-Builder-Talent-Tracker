@@ -142,3 +142,77 @@ def _normalize(build_data: dict, all_data: dict) -> dict:
         "talents": talents,
         "all_talents": all_data,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pre-shrine talent identification
+# ---------------------------------------------------------------------------
+_WEAPON_ALT = {
+    "Light Wep.": "Light Weapon",
+    "Medium Wep.": "Medium Weapon",
+    "Heavy Wep.": "Heavy Weapon",
+    "Light Weapon": "Light Wep.",
+    "Medium Weapon": "Medium Wep.",
+    "Heavy Weapon": "Heavy Wep.",
+}
+
+
+def _stat_val(stats: dict[str, int], name: str) -> int:
+    """Lookup stat value, handling weapon-name variations between APIs."""
+    if name in stats:
+        return stats[name]
+    alt = _WEAPON_ALT.get(name)
+    return stats.get(alt, 0) if alt else 0
+
+
+def _reqs_met(reqs: dict, stats: dict[str, int]) -> bool:
+    """Check if all stat requirements in *reqs* are satisfied by *stats*."""
+    for name, val in reqs.get("base", {}).items():
+        val = int(val or 0)
+        if val <= 0:
+            continue
+        if name == "Body":
+            available = sum(_stat_val(stats, s) for s in ("Strength", "Fortitude", "Agility"))
+        elif name == "Mind":
+            available = sum(_stat_val(stats, s) for s in ("Intelligence", "Willpower", "Charisma"))
+        else:
+            available = _stat_val(stats, name)
+        if available < val:
+            return False
+    for name, val in reqs.get("weapon", {}).items():
+        val = int(val or 0)
+        if val <= 0:
+            continue
+        if _stat_val(stats, name) < val:
+            return False
+    for name, val in reqs.get("attunement", {}).items():
+        val = int(val or 0)
+        if val <= 0:
+            continue
+        if _stat_val(stats, name) < val:
+            return False
+    return True
+
+
+def identify_pre_shrine_talents(
+    build_talents: list[str],
+    all_data: dict,
+    pre_shrine: dict[str, int],
+    final_stats: dict[str, int],
+) -> set[str]:
+    """
+    Identify build talents that can ONLY be obtained before Shrine of Order.
+    A talent is "pre-shrine only" when its stat requirements are met by the
+    pre-shrine allocation but NOT met by the final (post-shrine) stats.
+    """
+    all_talents = all_data.get("talents", {})
+    result: set[str] = set()
+    for talent_name in build_talents:
+        data = all_talents.get(talent_name.lower())
+        if not data:
+            continue
+        reqs = data.get("reqs", {})
+        if _reqs_met(reqs, pre_shrine) and not _reqs_met(reqs, final_stats):
+            result.add(talent_name)
+    log.info("Pre-shrine-only talents: %d / %d", len(result), len(build_talents))
+    return result

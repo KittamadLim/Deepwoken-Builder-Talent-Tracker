@@ -14,7 +14,10 @@ except Exception:
 import cv2
 import mss
 import numpy as np
-import pytesseract
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None  # type: ignore[assignment]
 from PyQt5.QtCore import QThread, pyqtSignal
 from rapidfuzz import fuzz, process as fuzz_process
 
@@ -38,11 +41,16 @@ _TESSERACT_CANDIDATES = [
     ),
 ]
 
-for _candidate in _TESSERACT_CANDIDATES:
-    if _candidate and os.path.isfile(_candidate):
-        pytesseract.pytesseract.tesseract_cmd = _candidate
-        log.info("Tesseract found at: %s", _candidate)
-        break
+_TESSERACT_AVAILABLE = False
+if pytesseract is not None:
+    for _candidate in _TESSERACT_CANDIDATES:
+        if _candidate and os.path.isfile(_candidate):
+            pytesseract.pytesseract.tesseract_cmd = _candidate
+            _TESSERACT_AVAILABLE = True
+            log.info("Tesseract found at: %s", _candidate)
+            break
+if not _TESSERACT_AVAILABLE:
+    log.info("Tesseract not found — RapidOCR will be used as the primary OCR engine")
 
 TESS_CONFIG_LINE  = "--psm 7 --oem 3"   # single text line (card title strip)
 TESS_CONFIG_PANEL = "--psm 6 --oem 3"  # uniform block — reads every row top-to-bottom
@@ -122,19 +130,53 @@ def _ocr_card_title(img: np.ndarray, debug: bool = False, region_idx: int = -1) 
     Fallback: adaptive threshold + PSM 6 (uniform block) for wrapped titles
               like \"Old Habits Die Hard\" that may span two lines in the banner.
     """
+    # Crop the image inward to exclude ornamental frame elements (pillars,
+    # diamond ornament) that surround the text on the parchment banner.
+    # These decorations are read as spurious characters (e.g. "I") by OCR.
+    h_orig, w_orig = img.shape[:2]
+    inset_x = max(4, int(w_orig * 0.10))   # ~10% from each side
+    inset_y = max(2, int(h_orig * 0.12))   # ~12% from top/bottom
+    img = img[inset_y:h_orig - inset_y, inset_x:w_orig - inset_x]
+
     # --- RapidOCR path (no subprocess, ~3-5× faster) ---
     rapid = _get_rapid_ocr()
     if rapid is not None:
-        result, _ = rapid(img[:, :, :3])
+        # 3× upscale preserving color — the Deepwoken title uses an ornate
+        # serif font at ~30-50 px source height; more pixels help the CRNN
+        # recognition model significantly.
+        # Unsharp mask sharpens text strokes against the parchment background.
+        _proc = cv2.resize(img[:, :, :3], (0, 0), fx=3, fy=3,
+                           interpolation=cv2.INTER_CUBIC)
+        _blur = cv2.GaussianBlur(_proc, (0, 0), 1.5)
+        _proc = cv2.addWeighted(_proc, 1.5, _blur, -0.5, 0)  # unsharp mask
+        if debug:
+            _save_debug(_proc, f"card_r{region_idx}_rapid_input")
+        result, _ = rapid(_proc)
         if result:
-            raw = " ".join(item[1] for item in result if float(item[2]) >= 0.3)
+            # Sort text blocks left-to-right by X coordinate to ensure
+            # correct reading order (RapidOCR may return them out of order).
+            result.sort(key=lambda item: item[0][0][0])
+            raw = " ".join(item[1] for item in result if float(item[2]) >= 0.05)
             cands = _clean_lines(raw)
             if debug:
-                log.debug("[RapidOCR] card r%d → %r", region_idx, cands)
-            return raw, cands
-        return "", []
+                log.debug("[RapidOCR] card r%d → raw=%r  cands=%r", region_idx, raw, cands)
+            if cands:
+                return raw, cands
+        # RapidOCR returned nothing usable — fall through to Tesseract.
+        # This happens on very ornate/italic fonts where the ONNX model
+        # assigns low confidence to every detected glyph.
+        if debug:
+            log.debug("[RapidOCR] card r%d no candidates — trying Tesseract", region_idx)
 
     # --- Tesseract fallback ---
+    if not _TESSERACT_AVAILABLE:
+        if rapid is None:
+            log.error(
+                "No OCR engine available! Install rapidocr-onnxruntime: "
+                "pip install rapidocr-onnxruntime"
+            )
+        return "", []
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
     gray3x = _upscale(gray, 3)
     adaptive = cv2.adaptiveThreshold(
@@ -191,6 +233,8 @@ def _preprocess_panel(img: np.ndarray) -> np.ndarray:
 
 
 def _extract_text(img: np.ndarray, config: str) -> str:
+    if not _TESSERACT_AVAILABLE:
+        return ""
     return pytesseract.image_to_string(img, config=config).strip()
 
 
@@ -277,12 +321,18 @@ def _score_talent_in_line(talent_clean: str, candidate: str) -> float:
             s = fuzz.ratio(talent_clean, window)
             if s <= best:
                 continue
-            # For win >= k (exact and noise-absorbing windows) every talent
-            # token must approximately match some window token.  This rejects
-            # windows where only a shared prefix drives the score.
-            # k-1 windows skip this check — they intentionally have fewer
-            # tokens (merged-word OCR artefact case).
+            # For win >= k every talent token must approximately match some
+            # window token — rejects shared-prefix false positives.
             if win >= k and not _tokens_present(t_tokens, w_tokens):
+                continue
+            # k-1 windows are only valid for merged OCR tokens
+            # (e.g. "speeddemon" → "speed demon", ~95 %).
+            # Require 85 minimum so a single shared word cannot drive the
+            # score for a longer talent:
+            #   "resolve"      vs "magical resolve"      = 63.6 % → rejected
+            #   "shadowcaster" vs "adept shadowcaster"   = 80.0 % → rejected
+            #   "speeddemon"   vs "speed demon"          = 95.2 % → passes
+            if win < k and s < 85:
                 continue
             best = s
             if best >= 100:
@@ -318,13 +368,392 @@ def _hash_frame(img: np.ndarray) -> bytes:
     return hashlib.md5(img.tobytes()).digest()
 
 def _capture_region(sct: mss.base.MSSBase, region: dict) -> np.ndarray:
-    mon = {"top": region["y"], "left": region["x"], "width": region["w"], "height": region["h"]}
+    mon = {"top": int(region["y"]), "left": int(region["x"]),
+           "width": int(region["w"]), "height": int(region["h"])}
     return np.array(sct.grab(mon))
+
+
+# ---------------------------------------------------------------------------
+# Card detector — parchment title-banner contour detection (primary)
+#                 + gold column-profile fallback
+# ---------------------------------------------------------------------------
+
+_CARD_DETECT_HSV_DEFAULT: dict = {
+    "h_lo": 12, "h_hi": 38,   # warm gold/amber in OpenCV Hue 0-179
+    "s_lo": 80, "s_hi": 255,  # avoid grey/unsaturated areas
+    "v_lo": 90, "v_hi": 255,  # avoid very dark areas
+}
+
+_VALID_CARD_COUNTS = (3, 5, 6)
+
+
+def _snap_to_valid_count(result: list[dict]) -> list[dict]:
+    """Snap card list to the nearest valid Deepwoken card count (3, 5, 6)."""
+    raw_n = len(result)
+    if raw_n in _VALID_CARD_COUNTS:
+        return result
+    target = min(_VALID_CARD_COUNTS, key=lambda c: abs(c - raw_n))
+    if raw_n > target:
+        result.sort(key=lambda r: r["w"], reverse=True)
+        result = result[:target]
+        result.sort(key=lambda r: r["x"])
+    log.info("[CARDDET] %d cards → snapped to %d (valid: %s)", raw_n, len(result), _VALID_CARD_COUNTS)
+    return result
+
+
+def _detect_parchment_banners(
+    bgr: np.ndarray,
+    img_h: int,
+    img_w: int,
+    region_x: int,
+    region_y: int,
+    debug: bool,
+) -> list[dict]:
+    """
+    Primary card detector: find the parchment/tan-colored title banners.
+
+    Each Deepwoken talent card has a distinctive ribbon/scroll title banner
+    at the top.  The banner color (warm beige, low saturation, high value)
+    is distinct from the gold frame (high saturation) and the dark game
+    background.  Banners are physically separated even when cards are
+    adjacent, making contour/connected-component analysis reliable.
+
+    Returns [] if fewer than 3 plausible banners are found.
+    """
+    # Title banners are in the top ~28% of the card capture region
+    banner_zone_h = max(60, min(int(img_h * 0.28), 120))
+    banner_zone = bgr[:banner_zone_h]
+
+    hsv_bz = cv2.cvtColor(banner_zone, cv2.COLOR_BGR2HSV)
+
+    # Parchment: warm beige — LOW saturation, HIGH brightness
+    # Gold frame: same hue range but HIGH saturation → excluded
+    parch_lo = np.array([8, 10, 130], dtype=np.uint8)
+    parch_hi = np.array([40, 135, 248], dtype=np.uint8)
+    parch_mask = cv2.inRange(hsv_bz, parch_lo, parch_hi)
+
+    # Close horizontally: connect pixles within each banner
+    close_w = max(15, img_w // 80)
+    kern_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, 5))
+    parch_mask = cv2.morphologyEx(parch_mask, cv2.MORPH_CLOSE, kern_close)
+
+    # Open: remove small noise blobs
+    kern_open = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
+    parch_mask = cv2.morphologyEx(parch_mask, cv2.MORPH_OPEN, kern_open)
+
+    if debug:
+        _save_debug(cv2.cvtColor(parch_mask, cv2.COLOR_GRAY2BGR), "parchment_mask")
+
+    # Connected component analysis
+    num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(parch_mask)
+
+    # Size filters relative to image width
+    min_w = max(50, img_w // 20)   # ~96 px at 1920
+    max_w = img_w // 2
+    min_h = 8
+    min_area = min_w * 6
+
+    banners: list[dict] = []
+    for i in range(1, num_labels):
+        bx = int(stats[i, cv2.CC_STAT_LEFT])
+        by = int(stats[i, cv2.CC_STAT_TOP])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        ba = int(stats[i, cv2.CC_STAT_AREA])
+        if bw >= min_w and bw <= max_w and bh >= min_h and ba >= min_area:
+            aspect = bw / max(bh, 1)
+            if aspect >= 1.5:
+                banners.append({"x": bx, "y": by, "w": bw, "h": bh, "area": ba})
+
+    banners.sort(key=lambda b: b["x"])
+
+    # Remove outliers: reject banners whose width OR Y-position differs
+    # significantly from the median.  This kills false positives from card
+    # description text or class-name strips that happen to match parchment hue.
+    if len(banners) >= 3:
+        ws = sorted(b["w"] for b in banners)
+        median_w = ws[len(ws) // 2]
+        ys = sorted(b["y"] for b in banners)
+        median_y = ys[len(ys) // 2]
+        banners = [
+            b for b in banners
+            if abs(b["w"] - median_w) / max(median_w, 1) < 0.50
+            and abs(b["y"] - median_y) <= max(15, median_y * 0.15)
+        ]
+
+    if len(banners) < 3:
+        log.info("[CARDDET] Parchment found only %d banner(s) (need ≥3)", len(banners))
+        return []
+
+    pad_x, pad_y = 4, 4
+    result = []
+    for b in banners:
+        rx = region_x + max(0, b["x"] - pad_x)
+        ry = region_y + max(0, b["y"] - pad_y)
+        rw = min(b["w"] + 2 * pad_x, img_w - b["x"] + pad_x)
+        rh = b["h"] + 2 * pad_y
+        result.append({"x": int(rx), "y": int(ry), "w": int(rw), "h": int(rh)})
+
+    result = _snap_to_valid_count(result)
+    log.info("[CARDDET] Parchment OK: %d card(s): %s", len(result), result)
+    return result
+
+
+def _detect_gold_fallback(
+    bgr: np.ndarray,
+    img_h: int,
+    img_w: int,
+    region_x: int,
+    region_y: int,
+    hsv_cfg: dict | None,
+    parchment_banners: list[dict],
+    debug: bool,
+) -> list[dict]:
+    """
+    Fallback card detector: gold column-profile with improvements.
+
+    Uses a mid-band row slice (30%–60% of image height) where the gap
+    between card frames is widest.  Also splits overly-wide spans that
+    result from adjacent gold frames merging.
+    """
+    cfg = hsv_cfg if hsv_cfg else _CARD_DETECT_HSV_DEFAULT
+    hsv_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lo = np.array([cfg["h_lo"], cfg["s_lo"], cfg["v_lo"]], dtype=np.uint8)
+    hi = np.array([cfg["h_hi"], cfg["s_hi"], cfg["v_hi"]], dtype=np.uint8)
+    gold_mask = cv2.inRange(hsv_full, lo, hi)
+
+    kern_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    gold_mask = cv2.dilate(gold_mask, kern_dil, iterations=1)
+
+    if debug:
+        _save_debug(cv2.cvtColor(gold_mask, cv2.COLOR_GRAY2BGR), "card_detect_mask")
+
+    # Use a mid-band where inter-card gaps are widest
+    band_top = int(img_h * 0.30)
+    band_bot = int(img_h * 0.60)
+    mid_band = gold_mask[band_top:band_bot, :]
+    band_h = max(1, band_bot - band_top)
+
+    col_profile = mid_band.sum(axis=0).astype(np.float32) / (255.0 * band_h)
+    sw = max(5, img_w // 150)
+    col_smooth = np.convolve(col_profile, np.ones(sw, np.float32) / sw, mode="same")
+
+    if float(col_smooth.max()) < 0.01:
+        log.debug("[CARDDET] Gold fallback: density too low")
+        return [], False
+
+    threshold_val = max(0.015, float(col_smooth.max()) * 0.20)
+
+    spans: list[tuple[int, int]] = []
+    in_span = False
+    start = 0
+    for xi in range(img_w):
+        if not in_span and col_smooth[xi] >= threshold_val:
+            start = xi
+            in_span = True
+        elif in_span and col_smooth[xi] < threshold_val:
+            spans.append((start, xi))
+            in_span = False
+    if in_span:
+        spans.append((start, img_w))
+
+    # Merge only very small gaps (< 15 px) — reduced from 30 to avoid merging adjacent cards
+    merged: list[tuple[int, int]] = []
+    for s, e in spans:
+        if merged and s - merged[-1][1] < 15:
+            merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+
+    widths = [e - s for s, e in merged]
+    if widths:
+        median_w = sorted(widths)[len(widths) // 2]
+        min_w = max(60, int(median_w * 0.35))
+    else:
+        min_w = 60
+
+    card_spans = [(s, e) for s, e in merged if e - s >= min_w]
+
+    # Split overly-wide spans (> 1.6× median → likely two merged cards)
+    if len(card_spans) >= 2:
+        expected_w = sorted([e - s for s, e in card_spans])[len(card_spans) // 2]
+        split_spans: list[tuple[int, int]] = []
+        for s, e in card_spans:
+            w = e - s
+            if w > expected_w * 1.6:
+                n = max(2, round(w / expected_w))
+                sub_w = w / n
+                for j in range(n):
+                    split_spans.append((int(s + j * sub_w), int(s + (j + 1) * sub_w)))
+            else:
+                split_spans.append((s, e))
+        card_spans = split_spans
+
+    if not card_spans:
+        log.debug("[CARDDET] Gold fallback: no valid spans")
+        return [], False
+
+    # Determine title banner Y/H from parchment banners if any were found,
+    # otherwise use a heuristic position near the top of the capture region.
+    if parchment_banners:
+        avg_y = int(np.mean([b["y"] for b in parchment_banners]))
+        avg_h = int(np.mean([b["h"] for b in parchment_banners]))
+        title_y = max(0, avg_y - 4)
+        title_h = avg_h + 8
+    else:
+        title_y = max(0, int(img_h * 0.04))
+        title_h = max(35, int(img_h * 0.13))
+
+    result: list[dict] = [
+        {"x": int(region_x + s), "y": int(region_y + title_y), "w": int(e - s), "h": int(title_h)}
+        for s, e in card_spans
+    ]
+
+    result = _snap_to_valid_count(result)
+    log.info("[CARDDET] Gold fallback: %d card(s): %s", len(result), result)
+    return result, False
+
+
+def detect_cards(
+    img: np.ndarray,
+    region_x: int = 0,
+    region_y: int = 0,
+    hsv_cfg: dict | None = None,
+    debug: bool = False,
+) -> tuple[list[dict], bool]:
+    """
+    Detect Deepwoken talent card title-strip positions from a screenshot.
+
+    Primary algorithm: **parchment banner detection** — finds the distinctive
+    tan/beige title ribbon on each card using HSV color filtering +
+    connected-component analysis.  Banners are physically separated between
+    cards, giving reliable per-card detection.
+
+    Fallback: **gold border column-profile** — used when parchment detection
+    finds fewer than 3 banners (e.g. unusual monitor color profile).
+
+    Parameters
+    ----------
+    img      : BGRA or BGR screenshot of the card-search region.
+    region_x : Screen X offset of img[0,0] — screen-coord results.
+    region_y : Screen Y offset of img[0,0].
+    hsv_cfg  : HSV range dict for gold filter fallback.
+    debug    : Save debug masks to debug/ when True.
+
+    Returns
+    -------
+    (rects, is_primary) — rects is a list of {x, y, w, h} dicts in screen
+    coordinates sorted left-to-right.  is_primary is True when the parchment
+    method succeeded, False when the gold fallback was used.
+    """
+    bgr = img[:, :, :3]
+    img_h, img_w = bgr.shape[:2]
+
+    # ── Primary: parchment banner detection ────────────────────────────────
+    result = _detect_parchment_banners(bgr, img_h, img_w, region_x, region_y, debug)
+    if result:
+        return result, True
+
+    # ── Fallback: gold column-profile with improvements ────────────────────
+    # Pass any partially-detected parchment banners for Y/H hinting.
+    banner_zone_h = max(60, min(int(img_h * 0.28), 120))
+    banner_zone = bgr[:banner_zone_h]
+    hsv_bz = cv2.cvtColor(banner_zone, cv2.COLOR_BGR2HSV)
+    parch_lo = np.array([8, 10, 130], dtype=np.uint8)
+    parch_hi = np.array([40, 135, 248], dtype=np.uint8)
+    parch_mask = cv2.inRange(hsv_bz, parch_lo, parch_hi)
+    close_w = max(15, img_w // 80)
+    kern_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, 5))
+    parch_mask = cv2.morphologyEx(parch_mask, cv2.MORPH_CLOSE, kern_close)
+    kern_open = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
+    parch_mask = cv2.morphologyEx(parch_mask, cv2.MORPH_OPEN, kern_open)
+    num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(parch_mask)
+    min_bw = max(50, img_w // 20)
+    partial_banners: list[dict] = []
+    for i in range(1, num_labels):
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        ba = int(stats[i, cv2.CC_STAT_AREA])
+        if bw >= min_bw and bh >= 8 and ba >= min_bw * 6:
+            partial_banners.append({
+                "x": int(stats[i, cv2.CC_STAT_LEFT]),
+                "y": int(stats[i, cv2.CC_STAT_TOP]),
+                "w": bw, "h": bh,
+            })
+
+    return _detect_gold_fallback(bgr, img_h, img_w, region_x, region_y, hsv_cfg, partial_banners, debug)
+
+
+def _infer_slot_regions(
+    cx_list: list[float],
+    strip_region: dict,
+    configured_regions: list[dict],
+) -> list[dict]:
+    """
+    Derive highlight slot regions dynamically from the X centres of all text
+    blobs detected in the strip image.
+
+    Algorithm:
+      1. Sort blob centre-X values (screen coordinates).
+      2. Find large gaps (> gap_threshold px) between consecutive centres —
+         each gap marks a boundary between card slots.
+      3. Build one region per cluster: left edge = cluster min-X − margin,
+         right edge = cluster max-X + margin, Y/H taken from configured_regions
+         or the strip region itself.
+      4. If clustering fails (too few blobs, or a very different count than
+         expected) fall back to the caller-supplied configured_regions.
+
+    The inferred regions replace the configured per-card regions only for
+    highlight-box positioning during this scan cycle — nothing is persisted.
+    """
+    if not cx_list:
+        return configured_regions
+
+    sorted_cx = sorted(cx_list)
+    # Gap threshold: treat spaces wider than 60 px (at 1920-wide screen) as
+    # inter-card gaps.  Cards are typically 200–230 px wide with ~30 px gaps
+    # between them, so 60 px cleanly separates cards without splitting words.
+    gap_threshold = 60.0
+
+    clusters: list[list[float]] = [[sorted_cx[0]]]
+    for cx in sorted_cx[1:]:
+        if cx - clusters[-1][-1] > gap_threshold:
+            clusters.append([])
+        clusters[-1].append(cx)
+
+    # Sanity: need at least 1 cluster and no more than 8 slots
+    if not clusters or len(clusters) > 8:
+        return configured_regions
+
+    # Derive Y and H from the first configured region when available,
+    # otherwise use the strip region itself.
+    ref = configured_regions[0] if configured_regions else strip_region
+    slot_y = ref["y"]
+    slot_h = ref["h"]
+    margin = 20  # px to pad each side of the cluster bounding box
+
+    inferred: list[dict] = []
+    for cluster in clusters:
+        left = int(min(cluster)) - margin
+        right = int(max(cluster)) + margin
+        inferred.append({
+            "x": max(0, left),
+            "y": slot_y,
+            "w": max(1, right - left),
+            "h": slot_h,
+        })
+
+    log.debug(
+        "[STRIP] Inferred %d slot region(s) from %d blobs (configured: %d)",
+        len(inferred), len(cx_list), len(configured_regions),
+    )
+    return inferred
 
 
 def _ocr_strip(
     strip_img: np.ndarray,
     strip_x: int,
+    strip_region: dict,
     ocr_regions: list[dict],
     talents_lower_clean: list[str],
     talents: list[str],
@@ -334,48 +763,62 @@ def _ocr_strip(
     """
     Single-image OCR across the full card-name banner strip.
 
-    Instead of N separate Tesseract calls (one per card slot), this function:
-      1. Upscales and binarises ONE wide image spanning all card banners.
-      2. Calls pytesseract.image_to_data(PSM 11 — sparse text) ONCE.
-      3. Maps each returned word back to its card slot via the per-card
-         region x boundaries stored in ocr_regions.
-      4. Fuzzy-matches each slot's word cluster against the build talent list.
+    Slot regions are *inferred* from the X positions of detected text blobs
+    each scan cycle via _infer_slot_regions.  This means the correct number
+    of highlight boxes is generated automatically whether 5 or 6 (or any
+    other count) cards are currently showing — no manual reconfiguration
+    needed when the game changes card count and repositions them.
 
-    Speed benefit: 1 Tesseract subprocess instead of N (5–6×  faster).
-    Accuracy benefit: PSM 11 is designed for scattered text on non-uniform
-    backgrounds, so it handles the stylised card banners well.
-    6-card support: naturally handles any number of configured slots.
+    Falls back to the saved ocr_regions when clustering produces no result.
     """
-    # Group words by card slot using their horizontal centre position.
-    slot_words: dict[int, list[str]] = {}
+    # ------------------------------------------------------------------
+    # Step 1: gather (screen_x, text) pairs from OCR
+    # ------------------------------------------------------------------
+    raw_words: list[tuple[float, str]] = []   # (screen_x, text)
+
+    # Preprocess the strip: 2× upscale using the original color image.
+    # Preserving color (white title text on tan/parchment banner) gives
+    # RapidOCR better text/background contrast than grayscale conversion.
+    # CLAHE is intentionally NOT used — it enhances background texture
+    # as much as text strokes on heavily decorated card banners.
+    # 3× upscale + unsharp mask for better RapidOCR accuracy on the
+    # ornate Deepwoken card-name serif font.
+    _strip_ocr = cv2.resize(strip_img[:, :, :3], (0, 0), fx=3, fy=3,
+                            interpolation=cv2.INTER_CUBIC)
+    _blur = cv2.GaussianBlur(_strip_ocr, (0, 0), 1.5)
+    _strip_ocr = cv2.addWeighted(_strip_ocr, 1.5, _blur, -0.5, 0)  # unsharp mask
+    _scale_x = 3  # box coordinates returned by OCR are in 3× space
+
     rapid = _get_rapid_ocr()
     if rapid is not None:
-        # --- RapidOCR path: one in-process ONNX call, no subprocess overhead ---
-        result, _ = rapid(strip_img[:, :, :3])
+        if debug:
+            _save_debug(_strip_ocr, "strip_preprocessed")
+        result, _ = rapid(_strip_ocr)
+        _rejected: list[tuple[float, str]] = []
         if result:
             for item in result:
                 box, text, conf = item[0], item[1], float(item[2])
-                if conf < 0.3 or not text.strip():
+                if not text.strip():
                     continue
-                # box: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] in original image coords
-                word_cx = (box[0][0] + box[2][0]) / 2.0
-                screen_x = strip_x + word_cx
-                slot = -1
-                for j, region in enumerate(ocr_regions):
-                    if region["x"] <= screen_x < region["x"] + region["w"]:
-                        slot = j
-                        break
-                if slot >= 0:
-                    slot_words.setdefault(slot, []).append(text)
-        if debug:
-            log.debug("[STRIP-RAPID] slot_words: %s", slot_words)
-    else:
-        # --- Tesseract fallback ---
-        gray = cv2.cvtColor(strip_img, cv2.COLOR_BGRA2GRAY)
-        scale = 3
-        gray3x = _upscale(gray, scale)
+                if conf < 0.05:
+                    _rejected.append((conf, text))
+                    continue
+                # Scale box coordinates back from 3× image space to screen space
+                word_cx = (box[0][0] + box[2][0]) / 2.0 / _scale_x
+                raw_words.append((strip_x + word_cx, text))
+        # Always log a summary so failures are visible without debug_images=true
+        log.info(
+            "[STRIP] RapidOCR raw result: %d accepted %s | %d rejected %s",
+            len(raw_words),
+            [(round(cx - strip_x), t) for cx, t in raw_words],
+            len(_rejected),
+            [(round(c, 2), t) for c, t in _rejected],
+        )
+    elif _TESSERACT_AVAILABLE:
+        _gray = cv2.cvtColor(strip_img[:, :, :3], cv2.COLOR_BGR2GRAY)
+        _gray3x = _upscale(_gray, 3)
         adaptive = cv2.adaptiveThreshold(
-            gray3x, 255,
+            _gray3x, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
             blockSize=51, C=10,
         )
@@ -386,32 +829,93 @@ def _ocr_strip(
             config="--psm 11 --oem 3",
             output_type=pytesseract.Output.DICT,
         )
-        n = len(data["text"])
-        for i in range(n):
+        _tess_scale = 3
+        for i in range(len(data["text"])):
             conf_val = int(data["conf"][i])
             text = data["text"][i].strip()
-            if conf_val < 30 or not text:
+            if conf_val < 20 or not text:
                 continue
-            # Convert from 3x-upscaled image coords → screen x
             word_cx_3x = data["left"][i] + data["width"][i] / 2.0
-            screen_x = strip_x + word_cx_3x / scale
-            slot = -1
-            for j, region in enumerate(ocr_regions):
-                if region["x"] <= screen_x < region["x"] + region["w"]:
-                    slot = j
-                    break
-            if slot >= 0:
-                slot_words.setdefault(slot, []).append(text)
-        if debug:
-            log.debug("[STRIP] slot_words: %s", slot_words)
+            raw_words.append((strip_x + word_cx_3x / _tess_scale, text))
+        log.info(
+            "[STRIP] Tesseract raw result: %d words %s",
+            len(raw_words),
+            [(round(cx - strip_x), t) for cx, t in raw_words],
+        )
 
+    # ------------------------------------------------------------------
+    # Step 2: infer slot regions from blob X positions this cycle
+    # ------------------------------------------------------------------
+    active_regions = _infer_slot_regions(
+        [cx for cx, _ in raw_words],
+        strip_region,
+        ocr_regions,
+    )
+
+    # Step 2.5: override with calibrated template when one exists for the
+    # detected card count.  Prefer exact count; fall back to the nearest
+    # configured count within ±1 to survive a single false-positive span
+    # (e.g., detector finds 6 but only "5" template is configured).
+    _detected_count = len(active_regions)
+    if _detected_count > 0:
+        _region_sets = load_config().get("ocr_region_sets", {})
+        _template = _region_sets.get(str(_detected_count))
+        if not (_template and len(_template) == _detected_count):
+            # Nearest configured count within ±1
+            _avail = sorted((int(k) for k in _region_sets if _region_sets.get(k)),
+                            key=lambda c: abs(c - _detected_count))
+            for _c in _avail:
+                if abs(_c - _detected_count) <= 1:
+                    _cand = _region_sets.get(str(_c))
+                    if _cand:
+                        _template = _cand
+                        log.info("[STRIP] Count=%d → using %d-card template (±%d fallback)",
+                                 _detected_count, _c, abs(_c - _detected_count))
+                        break
+        if _template:
+            active_regions = _template
+            log.debug("[STRIP] Template applied (%d regions)", len(_template))
+
+    # ------------------------------------------------------------------
+    # Step 3: assign each word to its inferred slot
+    # ------------------------------------------------------------------
+    slot_words: dict[int, list[str]] = {}
+    for screen_x, text in raw_words:
+        slot = -1
+        for j, region in enumerate(active_regions):
+            if region["x"] <= screen_x < region["x"] + region["w"]:
+                slot = j
+                break
+        if slot < 0:
+            slot = len(active_regions)  # overflow bucket
+        slot_words.setdefault(slot, []).append(text)
+
+    if debug:
+        log.debug("[STRIP] active_regions=%d slot_words=%s", len(active_regions), slot_words)
+
+    # ------------------------------------------------------------------
+    # Step 4: fuzzy-match each slot's text against the build talent list
+    # ------------------------------------------------------------------
     detected: list[str] = []
     slot_hits: list[tuple[int, str]] = []
+    # Per-slot debug info — one dict per active region slot
+    slot_debug: list[dict] = [
+        {"slot": i, "raw": "", "match": None, "near_miss": None, "score": 0.0}
+        for i in range(len(active_regions))
+    ]
 
     for slot, words in slot_words.items():
         candidate = " ".join(words).lower()
         candidate = _JUNK_PREFIX.sub("", candidate)
         candidate = re.sub(r"[^a-z '\-]", "", candidate).strip()
+        # Keep a debug entry for this slot (overflow slots appended on demand)
+        if slot < len(slot_debug):
+            _dbg = slot_debug[slot]
+        else:
+            _dbg = {"slot": slot, "raw": "", "match": None, "near_miss": None, "score": 0.0}
+            slot_debug.append(_dbg)
+        _dbg["raw"] = candidate
+
         if len(candidate) < 3:
             continue
 
@@ -423,24 +927,29 @@ def _ocr_strip(
                 best_score = s
                 best_idx = i
 
+        _dbg["score"] = best_score
+
         if best_idx >= 0 and best_score >= threshold:
             talent_name = talents[best_idx]
+            _dbg["match"] = talent_name
             if talent_name not in detected:
                 detected.append(talent_name)
-            hit = (slot, talent_name)
-            if hit not in slot_hits:
-                slot_hits.append(hit)
+            if slot < len(active_regions):
+                hit = (slot, talent_name)
+                if hit not in slot_hits:
+                    slot_hits.append(hit)
             log.info(
                 "[STRIP] Slot %d HIT: '%s'  (ocr=%r  score=%.1f)",
                 slot, talent_name, candidate, best_score,
             )
         elif best_idx >= 0 and best_score > 40:
-            log.debug(
+            _dbg["near_miss"] = talents[best_idx]
+            log.info(
                 "[STRIP] Slot %d NEAR-MISS: ocr=%r → '%s'  score=%.1f < thresh %d",
                 slot, candidate, talents_lower_clean[best_idx], best_score, threshold,
             )
 
-    return detected, slot_hits
+    return detected, slot_hits, active_regions, slot_debug
 
 
 class TalentScanner(QThread):
@@ -449,8 +958,11 @@ class TalentScanner(QThread):
     Starts PAUSED — call resume() (button or F6) to begin scanning.
     """
 
-    # (detected_names, missing_names, slot_hits: list[tuple[int, str]])
-    results_ready = pyqtSignal(list, list, list)
+    # (detected_names, missing_names, slot_hits: list[tuple[int,str]], active_regions: list[dict])
+    results_ready = pyqtSignal(list, list, list, list)
+    # Emitted each scan cycle when debug_ocr_highlight=true in config.
+    # Payload: {mode, strip_region, active_regions, slot_data}
+    debug_ocr_ready = pyqtSignal(dict)
 
     def __init__(self, build_talents: list[str], parent=None):
         super().__init__(parent)
@@ -470,6 +982,7 @@ class TalentScanner(QThread):
         # Per-region mode uses one hash per slot.
         self._strip_hash: bytes | None = None
         self._strip_cached: tuple[list, list] | None = None  # (detected, slot_hits)
+        self._parchment_rects: list[dict] | None = None  # last good parchment positions
         self._region_hashes: dict[int, bytes] = {}
         self._region_cached: dict[int, tuple[int, str] | None] = {}  # idx → hit
 
@@ -478,6 +991,7 @@ class TalentScanner(QThread):
         # Invalidate caches so the next resume starts with a fresh scan.
         self._strip_hash = None
         self._strip_cached = None
+        self._parchment_rects = None
         self._region_hashes.clear()
         self._region_cached.clear()
         log.info("TalentScanner paused")
@@ -514,38 +1028,145 @@ class TalentScanner(QThread):
                 slot_hits: list[tuple[int, str]] = []
 
                 # ----------------------------------------------------------------
-                # Strip mode: one grab + one Tesseract call for ALL slots at once.
-                # Activated when name_strip_region is configured (w > 0, h > 0).
+                # Mode priority:
+                #   1. card_detect_region — parchment banner detection (automatic)
+                #   2. name_strip_region  — whole-strip RapidOCR + word clustering
+                #   3. per-region fallback
                 # ----------------------------------------------------------------
+                card_detect_region = cfg.get("card_detect_region")
+                use_detect = bool(
+                    card_detect_region
+                    and card_detect_region.get("w", 0) > 0
+                    and card_detect_region.get("h", 0) > 0
+                )
+
                 strip_region = cfg.get("name_strip_region")
                 use_strip = bool(
-                    strip_region
+                    not use_detect
+                    and strip_region
                     and strip_region.get("w", 0) > 0
                     and strip_region.get("h", 0) > 0
                     and regions
                 )
 
-                if use_strip:
+                active_regions: list[dict] | None = None
+                _slot_debug: list[dict] = []
+
+                if use_detect:
+                    # --------------------------------------------------------
+                    # Card-detect mode: grab card area → detect title banners
+                    # via parchment color → OCR each banner directly.
+                    # No templates needed — detection gives exact positions.
+                    # --------------------------------------------------------
+                    try:
+                        detect_img = _capture_region(sct, card_detect_region)
+                        if debug_img:
+                            _save_debug(detect_img, "card_detect_raw")
+                        frame_hash = _hash_frame(detect_img)
+                        if frame_hash == self._strip_hash and self._strip_cached is not None:
+                            detected, slot_hits, active_regions, _slot_debug = self._strip_cached
+                            log.debug("[CARDDET] Frame unchanged — reusing cached results")
+                        else:
+                            self._strip_hash = frame_hash
+                            card_rects, is_primary = detect_cards(
+                                detect_img,
+                                card_detect_region["x"],
+                                card_detect_region["y"],
+                                cfg.get("card_detect_hsv"),
+                                debug_img,
+                            )
+                            if is_primary and card_rects:
+                                # Parchment succeeded — cache these positions.
+                                self._parchment_rects = list(card_rects)
+                            elif not is_primary and self._parchment_rects:
+                                # Parchment failed (likely overlay interference)
+                                # but we have cached positions — reuse them.
+                                card_rects = self._parchment_rects
+                                log.info(
+                                    "[CARDDET] Parchment failed, reusing %d cached positions",
+                                    len(card_rects),
+                                )
+                            if not card_rects:
+                                if self._strip_cached is not None:
+                                    detected, slot_hits, active_regions, _slot_debug = self._strip_cached
+                                    log.debug("[CARDDET] No cards found — holding cached results")
+                            else:
+                                active_regions = card_rects
+                                _slot_debug = []
+                                for _si, _sr in enumerate(card_rects):
+                                    _timg = _capture_region(sct, _sr)
+                                    if debug_img:
+                                        _save_debug(_timg, f"card_{_si}_title")
+                                    _raw, _cands = _ocr_card_title(_timg, debug_img, _si)
+                                    log.info("[CARDDET] Slot %d  raw=%r  cands=%s", _si, _raw, _cands)
+                                    _dbg: dict = {
+                                        "slot": _si, "raw": _raw,
+                                        "match": None, "near_miss": None, "score": 0.0,
+                                    }
+                                    _slot_debug.append(_dbg)
+                                    if not _cands:
+                                        continue
+                                    cand = " ".join(_cands).lower()
+                                    cand = _JUNK_PREFIX.sub("", cand)
+                                    cand = re.sub(r"[^a-z '\-]", "", cand).strip()
+                                    _dbg["raw"] = cand
+                                    if len(cand) < 3:
+                                        continue
+                                    _bscore, _bidx = 0.0, -1
+                                    for _ti, _tc in enumerate(self._talents_lower_clean):
+                                        _s = _score_talent_in_line(_tc, cand)
+                                        if _s > _bscore:
+                                            _bscore, _bidx = _s, _ti
+                                    _dbg["score"] = _bscore
+                                    if _bidx >= 0 and _bscore >= threshold:
+                                        _tn = self._talents[_bidx]
+                                        _dbg["match"] = _tn
+                                        if _tn not in detected:
+                                            detected.append(_tn)
+                                        slot_hits.append((_si, _tn))
+                                        log.info("[CARDDET] Slot %d HIT: '%s'  score=%.1f",
+                                                 _si, _tn, _bscore)
+                                    elif _bidx >= 0 and _bscore > 40:
+                                        _dbg["near_miss"] = self._talents[_bidx]
+                                        log.info(
+                                            "[CARDDET] Slot %d NEAR-MISS: ocr=%r → '%s'  score=%.1f",
+                                            _si, cand, self._talents_lower_clean[_bidx], _bscore,
+                                        )
+
+                                log.info(
+                                    "[CARDDET] %d card(s) detected → %d hit(s): %s",
+                                    len(card_rects), len(slot_hits),
+                                    [t for _, t in slot_hits],
+                                )
+                                self._strip_cached = (
+                                    list(detected), list(slot_hits),
+                                    list(active_regions), list(_slot_debug),
+                                )
+                    except Exception as exc:
+                        log.warning("[CARDDET] Error: %s", exc, exc_info=True)
+
+                elif use_strip:
                     try:
                         strip_img = _capture_region(sct, strip_region)
                         if debug_img:
                             _save_debug(strip_img, "strip_raw")
                         frame_hash = _hash_frame(strip_img)
                         if frame_hash == self._strip_hash and self._strip_cached is not None:
-                            detected, slot_hits = self._strip_cached
+                            detected, slot_hits, active_regions, _slot_debug = self._strip_cached
                             log.debug("[STRIP] Frame unchanged — reusing cached results")
                         else:
                             self._strip_hash = frame_hash
-                            detected, slot_hits = _ocr_strip(
+                            detected, slot_hits, active_regions, _slot_debug = _ocr_strip(
                                 strip_img,
                                 strip_region["x"],
+                                strip_region,
                                 regions,
                                 self._talents_lower_clean,
                                 self._talents,
                                 threshold,
                                 debug_img,
                             )
-                            self._strip_cached = (list(detected), list(slot_hits))
+                            self._strip_cached = (list(detected), list(slot_hits), list(active_regions), list(_slot_debug))
                     except Exception as exc:
                         log.warning("Strip OCR error: %s", exc)
 
@@ -557,6 +1178,10 @@ class TalentScanner(QThread):
                     # Tesseract again.  This is the biggest win when the card
                     # selection screen is static between scan intervals.
                     # --------------------------------------------------------
+                    _region_debug_entries: list[dict] = [
+                        {"slot": i, "raw": "", "match": None, "near_miss": None, "score": 0.0}
+                        for i in range(len(regions))
+                    ]
                     for region_idx, region in enumerate(regions):
                         try:
                             img = _capture_region(sct, region)
@@ -570,6 +1195,10 @@ class TalentScanner(QThread):
                                     if name not in detected:
                                         detected.append(name)
                                     slot_hits.append(cached)
+                                    _region_debug_entries[region_idx] = {
+                                        "slot": region_idx, "raw": "(cached)",
+                                        "match": name, "near_miss": None, "score": 100.0,
+                                    }
                                 continue  # skip Tesseract for this slot
                             self._region_hashes[region_idx] = frame_hash
 
@@ -641,16 +1270,41 @@ class TalentScanner(QThread):
                             if slot_match:
                                 slot_hits.append(slot_match)
 
+                            # Collect debug entry for this slot
+                            best_cand = candidates[0] if candidates else (raw_text[:60] if raw_text else "")
+                            _region_debug_entries[region_idx] = {
+                                "slot": region_idx,
+                                "raw": best_cand,
+                                "match": slot_match[1] if slot_match else None,
+                                "near_miss": None,
+                                "score": 0.0,
+                            }
+
                         except Exception as exc:
                             log.warning("OCR error in region %s: %s", region, exc)
 
+                # Collect region-mode debug entries into _slot_debug
+                if not use_strip and not use_detect:
+                    _slot_debug = _region_debug_entries
+
                 # "missing" = build talents the player does not own yet.
-                # Using known_owned_talents from config (persisted by the overlay)
-                # instead of "not in detected" — a detected card is one that
-                # is visible on screen and should be highlighted, not skipped.
                 cfg_owned = set(cfg.get("known_owned_talents", []))
                 missing = [t for t in self._talents if t not in cfg_owned]
-                self.results_ready.emit(detected, missing, slot_hits)
+                self.results_ready.emit(detected, missing, slot_hits, active_regions or [])
+
+                if cfg.get("debug_ocr_highlight", False):
+                    _mode = "detect" if use_detect else ("strip" if use_strip else "region")
+                    _search_r = (
+                        card_detect_region if use_detect
+                        else (strip_region if use_strip else None)
+                    )
+                    self.debug_ocr_ready.emit({
+                        "mode": _mode,
+                        "strip_region": _search_r,
+                        "active_regions": list(active_regions) if active_regions else regions,
+                        "slot_data": list(_slot_debug),
+                    })
+
                 self.msleep(interval)
 
         log.info("TalentScanner stopped")
@@ -700,41 +1354,96 @@ class ScanOwnedWorker(QThread):
         try:
             with mss.mss() as sct:
                 img = _capture_region(sct, region)
+
+                # ── Capture diagnostics (always logged) ──────────────────────────
+                _h, _w = img.shape[:2]
+                _mean_brightness = float(np.mean(img[:, :, :3]))
+                log.info(
+                    "Owned panel capture: %dx%d px  mean_brightness=%.1f",
+                    _w, _h, _mean_brightness,
+                )
+                if _mean_brightness < 10:
+                    log.warning(
+                        "Owned panel image is nearly black (mean=%.1f) — "
+                        "the region may be off-screen, minimised, or pointing at a black/empty area. "
+                        "Use ⚙ Settings → 'Pick Owned Talents Panel' to recalibrate.",
+                        _mean_brightness,
+                    )
+                    _save_debug(img, "owned_panel_raw")
+
                 if debug:
                     # Save the raw colour capture so the region boundary is easy
                     # to inspect alongside the binarized result.
                     _save_debug(img, "owned_panel_raw")
                 rapid = _get_rapid_ocr()
+                candidates: list[str] = []
+                _use_tesseract = True
+
                 if rapid is not None:
                     # RapidOCR handles multi-colour talent text (red/blue-green/
                     # white) better than Tesseract's grayscale pipeline.
-                    result, _ = rapid(img[:, :, :3])
-                    candidates: list[str] = []
-                    if result:
-                        for item in result:
-                            if float(item[2]) >= 0.3:
-                                for cleaned in _clean_lines(item[1], skip_headers=True):
-                                    if cleaned not in candidates:
-                                        candidates.append(cleaned)
-                else:
-                    processed = _preprocess_panel(img)
-                    if debug:
-                        _save_debug(processed, "owned_panel_bin")
-                    raw_text = _extract_text(processed, TESS_CONFIG_PANEL)
-                    candidates = _clean_lines(raw_text, skip_headers=True)
+                    try:
+                        result, _ = rapid(img[:, :, :3])
+                        _use_tesseract = False
+                        if result:
+                            for item in result:
+                                if float(item[2]) >= 0.3:
+                                    for cleaned in _clean_lines(item[1], skip_headers=True):
+                                        if cleaned not in candidates:
+                                            candidates.append(cleaned)
+                    except Exception as rapid_exc:
+                        log.warning(
+                            "RapidOCR failed on owned panel (%s) — falling back to Tesseract",
+                            rapid_exc,
+                        )
+                        _use_tesseract = True
 
-                    # Run a second pass with PSM 11 (sparse text) and merge unique
-                    # candidate lines.  PSM 6 (uniform block) reads every row but
-                    # can miss isolated text blocks; PSM 11 finds scattered words but
-                    # is noisier.  Both modes together give near-complete coverage.
-                    raw_text_11 = pytesseract.image_to_string(
-                        processed, config=TESS_CONFIG_PANEL.replace("--psm 6", "--psm 11")
-                    ).strip()
-                    for extra in _clean_lines(raw_text_11, skip_headers=True):
-                        if extra not in candidates:
-                            candidates.append(extra)
+                if _use_tesseract and _TESSERACT_AVAILABLE:
+                    try:
+                        processed = _preprocess_panel(img)
+                        if debug:
+                            _save_debug(processed, "owned_panel_bin")
+                        raw_text = _extract_text(processed, TESS_CONFIG_PANEL)
+                        candidates = _clean_lines(raw_text, skip_headers=True)
+
+                        # Run a second pass with PSM 11 (sparse text) and merge unique
+                        # candidate lines.  PSM 6 (uniform block) reads every row but
+                        # can miss isolated text blocks; PSM 11 finds scattered words but
+                        # is noisier.  Both modes together give near-complete coverage.
+                        raw_text_11 = pytesseract.image_to_string(
+                            processed, config=TESS_CONFIG_PANEL.replace("--psm 6", "--psm 11")
+                        ).strip()
+                        for extra in _clean_lines(raw_text_11, skip_headers=True):
+                            if extra not in candidates:
+                                candidates.append(extra)
+                    except Exception as tess_exc:
+                        log.error(
+                            "Owned panel scan failed: %s\n"
+                            "  → RapidOCR was %s. "
+                            "Install rapidocr-onnxruntime (pip install rapidocr-onnxruntime) "
+                            "or install Tesseract-OCR from https://github.com/UB-Mannheim/tesseract/wiki",
+                            tess_exc,
+                            "unavailable" if rapid is None else "available but failed",
+                        )
+                elif _use_tesseract and not _TESSERACT_AVAILABLE:
+                    log.warning(
+                        "Owned panel scan: RapidOCR unavailable and Tesseract not installed. "
+                        "Install rapidocr-onnxruntime: pip install rapidocr-onnxruntime"
+                    )
 
                 log.info("Owned scan raw candidates (%d): %s", len(candidates), candidates)
+
+                # ── 0-candidate diagnostic ───────────────────────────────────────
+                if not candidates:
+                    log.warning(
+                        "Owned panel OCR returned 0 text candidates. Possible causes:\n"
+                        "  • Region is off-screen or pointing at wrong area\n"
+                        "  • Game not visible / talent panel not open\n"
+                        "  • OCR engine failed (see errors above)\n"
+                        "  → Raw screenshot saved to debug/owned_panel_raw_*.png\n"
+                        "  → Enable 'debug_images' in Settings to also save the binarised result."
+                    )
+                    _save_debug(img, "owned_panel_raw")
 
                 # Bottom-up: for each build talent, find the candidate line
                 # that best contains that talent using a sliding n-gram window.
@@ -745,6 +1454,7 @@ class ScanOwnedWorker(QThread):
                 #   - merged OCR words ("speeddemon") score ~95 % via k-1 window
                 #   - one noise prefix/suffix token is absorbed by k+1 window
                 #   - single shared token ("dark" in wrong line) stays below ~65 %
+                _score_table: list[tuple[str, float, str]] = []  # (talent, best_score, best_cand)
                 for talent_name, talent_clean in zip(self._talents, self._talents_lower_clean):
                     best_score = 0.0
                     best_line_idx = -1
@@ -753,11 +1463,27 @@ class ScanOwnedWorker(QThread):
                         if score > best_score:
                             best_score = score
                             best_line_idx = line_idx
+                    best_cand = candidates[best_line_idx] if best_line_idx >= 0 else ""
+                    _score_table.append((talent_name, best_score, best_cand))
                     if best_score >= threshold and talent_name not in matched:
                         matched.append(talent_name)
                         log.info(
                             "Owned talent found: '%s' (in '%s', score=%.1f)",
-                            talent_name, candidates[best_line_idx], best_score,
+                            talent_name, best_cand, best_score,
+                        )
+
+                # ── 0-match-but-candidates diagnostic ───────────────────────────
+                if not matched and candidates:
+                    log.warning(
+                        "Owned panel: %d OCR line(s) found but none matched any build "
+                        "talent (threshold=%d). Closest scores (top 10):",
+                        len(candidates), threshold,
+                    )
+                    near_misses = sorted(_score_table, key=lambda t: t[1], reverse=True)
+                    for t_name, t_score, t_cand in near_misses[:10]:
+                        log.warning(
+                            "  %-35s → best score %.1f  (OCR line: '%s')",
+                            f"'{t_name}'", t_score, t_cand,
                         )
         except Exception as exc:
             log.error("Owned panel scan failed: %s", exc)

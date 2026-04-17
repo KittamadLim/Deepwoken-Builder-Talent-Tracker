@@ -14,13 +14,23 @@ import os
 import signal
 import sys
 
+# onnxruntime MUST be imported before PyQt5 and cv2 on Windows — all three
+# ship conflicting DLLs and whichever loads second gets a DLL init failure.
+# Doing it here in main.py guarantees it happens before any other import,
+# including the `from PyQt5...` lines below and the transitive imports they
+# pull in through highlight_overlay / overlay.
+try:
+    import onnxruntime as _ort  # noqa: F401
+except Exception:
+    pass
+
 # Ensure src/ is on the path so all modules import each other by bare name.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox
 
-from api import fetch_build
+from api import fetch_build, identify_pre_shrine_talents
 from highlight_overlay import CardHighlightOverlay
 from ocr import TalentScanner
 from optimizer import TALENT_DB, compute_priority
@@ -94,14 +104,21 @@ def main() -> None:
     # OverlayWindow must be created BEFORE CardHighlightOverlay so its HWND
     # can be passed in for permanent Z-order enforcement.
     scanner = TalentScanner(talents)
-    window = OverlayWindow(pre_order, post_order, talents, scanner, None)  # card_highlight set below
+    pre_shrine_talents = identify_pre_shrine_talents(
+        talents, build_data["all_talents"], build_data["pre_shrine"], build_data["stats"]
+    )
+    window = OverlayWindow(pre_order, post_order, talents, scanner, None, pre_shrine_talents=pre_shrine_talents)
 
     # Fullscreen transparent highlight overlay — always below OverlayWindow
     card_highlight = CardHighlightOverlay(overlay_hwnd=int(window.winId()))
     window._card_highlight = card_highlight  # wire reference now that both exist
 
     scanner.results_ready.connect(window.update_talents)
+    # 4th signal arg (active_regions) is accepted by update_highlights
+    # and used to position highlight boxes on the inferred slot positions.
     scanner.results_ready.connect(card_highlight.update_highlights)
+    # Debug OCR overlay — only emitted when debug_ocr_highlight=true in config
+    scanner.debug_ocr_ready.connect(card_highlight.update_debug_ocr)
     # When the player clicks a highlighted card, mark it as owned immediately.
     card_highlight.talent_picked.connect(window.mark_talent_picked)
     scanner.start()  # starts the QThread (internally paused until resumed)

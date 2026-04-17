@@ -1,3 +1,4 @@
+import ctypes
 import logging
 import time
 from pathlib import Path
@@ -190,6 +191,17 @@ QPushButton:disabled {
     color: #555555;
     border-color: #333333;
 }
+QLineEdit#talent_search {
+    background-color: rgba(20, 20, 30, 180);
+    color: #e0e0e0;
+    border: 1px solid #444466;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+}
+QLineEdit#talent_search:focus {
+    border-color: #6699cc;
+}
 """
 
 
@@ -223,43 +235,100 @@ class SettingsDialog(QDialog):
         btn_layout = QVBoxLayout(btn_wrapper)
         btn_layout.setContentsMargins(10, 4, 10, 0)
 
-        # --- Number of cards ---
-        cards_count_group = QGroupBox("Number of Cards to Track")
-        cards_count_form = QFormLayout(cards_count_group)
-        cards_count_form.setSpacing(4)
-        self._num_cards_sb = QSpinBox()
-        self._num_cards_sb.setRange(1, 6)
-        self._num_cards_sb.setValue(self._cfg.get("num_cards", 5))
-        self._num_cards_sb.setToolTip(
-            "Set to 6 if six cards can appear (e.g. Fold). "
-            "Reopen Settings after saving to see the new region picker."
+        # --- Card Auto-Detect (HSV gold border detector) ---
+        detect_outer = QGroupBox("Card Auto-Detect  ★ recommended")
+        detect_outer.setStyleSheet(
+            "QGroupBox { border: 1px solid #446644; color: #88ff88; }"
+            " QGroupBox::title { color: #88ff88; }"
         )
-        cards_count_form.addRow("Num cards (1–6)", self._num_cards_sb)
-        layout.addWidget(cards_count_group)
+        detect_layout = QVBoxLayout(detect_outer)
+        detect_layout.setContentsMargins(8, 10, 8, 8)
+        detect_layout.setSpacing(6)
 
-        # --- Five card-region groups (continuous card scanner) ---
-        num_cards: int = self._cfg.get("num_cards", 5)
+        detect_info = QLabel(
+            "Pick a region that covers ALL card frames (full card height).\n"
+            "The detector finds cards automatically using their golden border —\n"
+            "no per-card calibration needed.  Takes priority over Name Strip."
+        )
+        detect_info.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        detect_layout.addWidget(detect_info)
+
+        raw_det = self._cfg.get("card_detect_region") or {"x": 0, "y": 0, "w": 0, "h": 0}
+        det_form = QFormLayout()
+        det_form.setSpacing(4)
+        self._detect_widgets: dict[str, QSpinBox] = {}
+        for key, label in (("x", "X"), ("y", "Y"), ("w", "Width"), ("h", "Height")):
+            sb = QSpinBox()
+            sb.setRange(0, 7680)
+            sb.setValue(int(raw_det.get(key, 0)))
+            det_form.addRow(label, sb)
+            self._detect_widgets[key] = sb
+        pick_detect_btn = QPushButton("📌 Pick Card Area")
+        pick_detect_btn.clicked.connect(self._make_picker(self._detect_widgets))
+        det_form.addRow("", pick_detect_btn)
+        detect_layout.addLayout(det_form)
+
+        # HSV fine-tuning (advanced — collapsed behind a label)
+        hsv_group = QGroupBox("HSV Gold-Filter Tuning  (advanced)")
+        hsv_group.setCheckable(False)
+        hsv_form = QFormLayout(hsv_group)
+        hsv_form.setSpacing(3)
+        hsv_defaults = self._cfg.get("card_detect_hsv", {})
+        _hsv_defs = {"h_lo": 12, "h_hi": 38, "s_lo": 80, "s_hi": 255, "v_lo": 90, "v_hi": 255}
+        self._hsv_sb: dict[str, QSpinBox] = {}
+        for key, label, lo, hi in (
+            ("h_lo", "Hue min  (gold~12)", 0, 179),
+            ("h_hi", "Hue max  (gold~38)", 0, 179),
+            ("s_lo", "Sat min",            0, 255),
+            ("s_hi", "Sat max",            0, 255),
+            ("v_lo", "Val min",            0, 255),
+            ("v_hi", "Val max",            0, 255),
+        ):
+            sb = QSpinBox()
+            sb.setRange(lo, hi)
+            sb.setValue(int(hsv_defaults.get(key, _hsv_defs[key])))
+            hsv_form.addRow(label, sb)
+            self._hsv_sb[key] = sb
+        hsv_note = QLabel("Hue is OpenCV scale 0-179  (gold ≈ 12-38, green ≈ 60-80)")
+        hsv_note.setStyleSheet("color: #888888; font-size: 9px;")
+        hsv_form.addRow(hsv_note)
+        detect_layout.addWidget(hsv_group)
+        layout.addWidget(detect_outer)
+
+        # --- Card Region Templates ---
+        template_header_group = QGroupBox("Card Region Templates")
+        template_header_form = QFormLayout(template_header_group)
+        template_header_form.setSpacing(4)
+        # Mutable copy of saved per-count region sets; mutated as user switches counts
+        self._region_sets: dict[str, list] = dict(self._cfg.get("ocr_region_sets", {}))
+
+        self._template_count_sb = QSpinBox()
+        self._template_count_sb.setRange(1, 8)
+        template_info = QLabel(
+            "Switch the count to configure regions for that many cards.\n"
+            "Strip OCR detects card count each scan and picks the matching template.\n"
+            "Each count is saved independently (3, 5, 6 …)."
+        )
+        template_info.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        # Start on the first already-configured count, or 5 as default
+        _existing = sorted(self._region_sets.keys(), key=lambda k: int(k))
+        _initial_count = int(_existing[0]) if _existing else 5
+        self._template_count_sb.setValue(_initial_count)
+        template_header_form.addRow("Configure for N cards:", self._template_count_sb)
+        template_header_form.addRow(template_info)
+        layout.addWidget(template_header_group)
+
+        # Dynamic container — rebuilt whenever template count spinbox changes
+        self._regions_widget = QWidget()
+        self._regions_vbox = QVBoxLayout(self._regions_widget)
+        self._regions_vbox.setContentsMargins(0, 0, 0, 0)
+        self._regions_vbox.setSpacing(8)
+        layout.addWidget(self._regions_widget)
+
         self._region_widgets: list[dict[str, QSpinBox]] = []
-        regions = self._cfg.get("ocr_regions", [])
-        while len(regions) < num_cards:
-            regions.append({"x": 0, "y": 0, "w": 158, "h": 42})
-
-        for i, region in enumerate(regions[:num_cards]):
-            group = QGroupBox(f"Card Region {i + 1}  (F6 scanner)")
-            form = QFormLayout(group)
-            form.setSpacing(4)
-            widgets: dict[str, QSpinBox] = {}
-            for key, label in (("x", "X"), ("y", "Y"), ("w", "Width"), ("h", "Height")):
-                sb = QSpinBox()
-                sb.setRange(0, 7680)
-                sb.setValue(int(region.get(key, 0)))
-                form.addRow(label, sb)
-                widgets[key] = sb
-            pick_btn = QPushButton("📌 Pick on Screen")
-            pick_btn.clicked.connect(self._make_picker(widgets))
-            form.addRow("", pick_btn)
-            self._region_widgets.append(widgets)
-            layout.addWidget(group)
+        self._rebuild_region_pickers(_initial_count)
+        # Connect AFTER initial build so the first build doesn't trigger a save
+        self._template_count_sb.valueChanged.connect(self._on_template_count_changed)
 
         # --- Owned-talents panel region (one-shot F7 scan) ---
         panel_group = QGroupBox("Owned Talents Panel  (F7 one-shot scan)")
@@ -330,17 +399,21 @@ class SettingsDialog(QDialog):
         outer.addWidget(btn_wrapper)
 
     def _on_ok(self) -> None:
-        regions = []
-        for widgets in self._region_widgets:
-            regions.append({k: widgets[k].value() for k in ("x", "y", "w", "h")})
-        self._cfg["ocr_regions"] = regions
+        # Commit currently visible pickers into the region-sets dict
+        n = self._template_count_sb.value()
+        self._region_sets[str(n)] = self._read_region_widgets()
+        self._cfg["ocr_region_sets"] = self._region_sets
 
-        # Persist num_cards and pad/trim the region list to match.
-        new_nc = self._num_cards_sb.value()
-        self._cfg["num_cards"] = new_nc
-        while len(self._cfg["ocr_regions"]) < new_nc:
-            self._cfg["ocr_regions"].append({"x": 0, "y": 0, "w": 158, "h": 42})
-        self._cfg["ocr_regions"] = self._cfg["ocr_regions"][:new_nc]
+        # Backward compat: keep ocr_regions matching the active template
+        self._cfg["ocr_regions"] = self._region_sets[str(n)]
+
+        # Card auto-detect region
+        detect_vals = {k: self._detect_widgets[k].value() for k in ("x", "y", "w", "h")}
+        self._cfg["card_detect_region"] = (
+            detect_vals if detect_vals["w"] > 0 and detect_vals["h"] > 0 else None
+        )
+        # HSV gold-filter tuning
+        self._cfg["card_detect_hsv"] = {k: self._hsv_sb[k].value() for k in self._hsv_sb}
 
         self._cfg["talents_panel_region"] = {
             k: self._panel_widgets[k].value() for k in ("x", "y", "w", "h")
@@ -366,6 +439,46 @@ class SettingsDialog(QDialog):
                 ch.reapply_z_order()
             parent.raise_()
         self.accept()
+
+    def _read_region_widgets(self) -> list[dict]:
+        """Snapshot current picker spinbox values as a list of region dicts."""
+        return [{k: w[k].value() for k in ("x", "y", "w", "h")} for w in self._region_widgets]
+
+    def _on_template_count_changed(self, new_count: int) -> None:
+        """Save current pickers for the old count, then rebuild for new_count."""
+        old_count = len(self._region_widgets)
+        if old_count > 0:
+            self._region_sets[str(old_count)] = self._read_region_widgets()
+        self._rebuild_region_pickers(new_count)
+
+    def _rebuild_region_pickers(self, count: int) -> None:
+        """Clear the dynamic container and create `count` region picker groups."""
+        while self._regions_vbox.count():
+            item = self._regions_vbox.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._region_widgets = []
+
+        saved = list(self._region_sets.get(str(count), []))
+        while len(saved) < count:
+            saved.append({"x": 0, "y": 0, "w": 158, "h": 42})
+
+        for i, region in enumerate(saved[:count]):
+            group = QGroupBox(f"Card {i + 1}")
+            form = QFormLayout(group)
+            form.setSpacing(4)
+            widgets: dict[str, QSpinBox] = {}
+            for key, label in (("x", "X"), ("y", "Y"), ("w", "Width"), ("h", "Height")):
+                sb = QSpinBox()
+                sb.setRange(0, 7680)
+                sb.setValue(int(region.get(key, 0)))
+                form.addRow(label, sb)
+                widgets[key] = sb
+            pick_btn = QPushButton("📌 Pick on Screen")
+            pick_btn.clicked.connect(self._make_picker(widgets))
+            form.addRow("", pick_btn)
+            self._region_widgets.append(widgets)
+            self._regions_vbox.addWidget(group)
 
     def _make_picker(self, widgets: dict) -> callable:
         """Return a callback that opens the screen picker and fills the given spinboxes."""
@@ -419,14 +532,17 @@ class OverlayWindow(QWidget):
       F7 / 📷 button  — one-shot scan of the owned-talents panel, persists results
     """
 
-    def __init__(self, stat_order: list[dict], post_order: list[dict], build_talents: list[str], scanner, card_highlight=None):
+    def __init__(self, stat_order: list[dict], post_order: list[dict], build_talents: list[str], scanner, card_highlight=None, pre_shrine_talents=None):
         super().__init__()
         self._drag_pos = None
+        self._resize_start_global = None
+        self._resize_start_size = None
         self._talent_labels: dict[str, QLabel] = {}
         self._build_talents = build_talents
         self._scanner = scanner
         self._card_highlight = card_highlight
         self._scan_worker = None  # ScanOwnedWorker held here to prevent GC
+        self._pre_shrine_talents = pre_shrine_talents or set()
 
         # Load persisted owned talents from previous sessions
         cfg = load_config()
@@ -487,26 +603,45 @@ class OverlayWindow(QWidget):
         tracker_row.addWidget(self._status_lbl)
         root.addLayout(tracker_row)
 
+        # -------- Search bar --------
+        self._search_edit = QLineEdit()
+        self._search_edit.setObjectName("talent_search")
+        self._search_edit.setPlaceholderText("Search talents...")
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.textChanged.connect(self._on_search_changed)
+        root.addWidget(self._search_edit)
+
+        # -------- Pre-shrine legend (only shown if any pre-shrine-only talents exist) --------
+        if pre_shrine_talents:
+            legend_lbl = QLabel("⚑ = Pre-Shrine of Order only")
+            legend_lbl.setStyleSheet(
+                "color: #ffaa33; font-size: 10px; padding: 1px 0px;"
+            )
+            root.addWidget(legend_lbl)
+
         # -------- Talent labels --------
         talent_container = QWidget()
         talent_container.setObjectName("overlay")
-        talent_layout = QVBoxLayout(talent_container)
-        talent_layout.setContentsMargins(0, 0, 0, 0)
-        talent_layout.setSpacing(2)
+        self._talent_layout = QVBoxLayout(talent_container)
+        self._talent_layout.setContentsMargins(0, 0, 0, 0)
+        self._talent_layout.setSpacing(2)
 
         if build_talents:
-            for talent in build_talents:
+            owned = sorted(t for t in build_talents if t in self._known_owned)
+            unowned = sorted(t for t in build_talents if t not in self._known_owned)
+            for talent in owned + unowned:
                 lbl = QLabel()
+                pre = "⚑ " if talent in self._pre_shrine_talents else ""
                 if talent in self._known_owned:
-                    lbl.setText(f"[✓]  {talent}")
+                    lbl.setText(f"[✓]  {pre}{talent}")
                     lbl.setStyleSheet("color: #5dfc8a;")
                 else:
-                    lbl.setText(f"[ ]  {talent}")
+                    lbl.setText(f"[ ]  {pre}{talent}")
                     lbl.setStyleSheet("color: #666666;")
                 self._talent_labels[talent] = lbl
-                talent_layout.addWidget(lbl)
+                self._talent_layout.addWidget(lbl)
         else:
-            talent_layout.addWidget(QLabel("  (no talents in build)"))
+            self._talent_layout.addWidget(QLabel("  (no talents in build)"))
 
         scroll = QScrollArea()
         scroll.setWidget(talent_container)
@@ -548,14 +683,41 @@ class OverlayWindow(QWidget):
         app_row.addWidget(quit_btn)
         root.addLayout(app_row)
 
-        # -------- Row 3: reset --------
+        # -------- Row 3: reset + debug --------
         reset_row = QHBoxLayout()
         reset_row.addWidget(reset_btn)
+        self._debug_btn = QPushButton("🔍 OCR Debug: OFF")
+        self._debug_btn.setToolTip(
+            "Overlay colored boxes showing what each OCR slot is scanning,\n"
+            "the raw detected text, and whether it matched a build talent."
+        )
+        self._debug_btn.clicked.connect(self._toggle_debug_ocr)
+        # Restore button state from config
+        if load_config().get("debug_ocr_highlight", False):
+            self._debug_btn.setText("🔍 OCR Debug: ON")
+            self._debug_btn.setStyleSheet(
+                "background-color:#2a1a3a; color:#cc88ff;"
+                " border:1px solid #664488; border-radius:4px; padding:4px 10px; font-size:11px;"
+            )
+        reset_row.addWidget(self._debug_btn)
         root.addLayout(reset_row)
 
         self.adjustSize()
         self.move(50, 50)
         self.show()
+
+        # Make this overlay invisible to screen-capture APIs (mss, BitBlt)
+        # so it doesn't appear in the screenshots the OCR scanner grabs.
+        try:
+            hwnd = int(self.winId())
+            ok = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+            if ok:
+                log.info("[Z] WDA_EXCLUDEFROMCAPTURE applied to OverlayWindow")
+            else:
+                err = ctypes.windll.kernel32.GetLastError()
+                log.warning("[Z] SetWindowDisplayAffinity failed on OverlayWindow (err=%d)", err)
+        except Exception as exc:
+            log.warning("[Z] SetWindowDisplayAffinity unavailable on OverlayWindow: %s", exc)
 
     # ------------------------------------------------------------------
     # Tracking toggle (F6)
@@ -614,19 +776,38 @@ class OverlayWindow(QWidget):
 
     def _refresh_all_labels(self) -> None:
         """Redraw all talent labels from persisted known_owned (no live scan data)."""
+        self._reorder_talents()
+        search_text = self._search_edit.text().strip().lower()
         for talent, lbl in self._talent_labels.items():
+            pre = "⚑ " if talent in self._pre_shrine_talents else ""
             if talent in self._known_owned:
-                lbl.setText(f"[✓]  {talent}")
+                lbl.setText(f"[✓]  {pre}{talent}")
                 lbl.setStyleSheet("color: #5dfc8a;")
             else:
-                lbl.setText(f"[ ]  {talent}")
+                lbl.setText(f"[ ]  {pre}{talent}")
                 lbl.setStyleSheet("color: #666666;")
+            lbl.setVisible(not search_text or search_text in talent.lower())
+
+    def _reorder_talents(self) -> None:
+        """Sort talent labels: owned on top, then unowned (both alphabetical)."""
+        while self._talent_layout.count():
+            self._talent_layout.takeAt(0)
+        owned = sorted(t for t in self._build_talents if t in self._known_owned)
+        unowned = sorted(t for t in self._build_talents if t not in self._known_owned)
+        for talent in owned + unowned:
+            self._talent_layout.addWidget(self._talent_labels[talent])
+
+    def _on_search_changed(self, text: str) -> None:
+        """Filter talent labels by search text."""
+        filter_text = text.strip().lower()
+        for talent, lbl in self._talent_labels.items():
+            lbl.setVisible(not filter_text or filter_text in talent.lower())
 
     # ------------------------------------------------------------------
     # Live update from TalentScanner (only called while tracking is ON)
     # ------------------------------------------------------------------
     @pyqtSlot(list, list, list)
-    def update_talents(self, card_detected: list, _missing: list, _slot_hits: list) -> None:
+    def update_talents(self, card_detected: list, _missing: list, _slot_hits: list, _active_regions: list = None) -> None:
         """
         Update live display during F6 scanning.
         Does NOT persist — only F7 (scan owned) makes talents permanently owned.
@@ -635,17 +816,19 @@ class OverlayWindow(QWidget):
           [✗] red    = not visible, not yet owned
         """
         on_screen = set(card_detected)
+        search_text = self._search_edit.text().strip().lower()
         for talent, lbl in self._talent_labels.items():
+            pre = "⚑ " if talent in self._pre_shrine_talents else ""
             if talent in self._known_owned:
-                lbl.setText(f"[✓]  {talent}")
+                lbl.setText(f"[✓]  {pre}{talent}")
                 lbl.setStyleSheet("color: #5dfc8a;")
             elif talent in on_screen:
-                # Visible on screen — OCR saw it. Highlight overlay will draw a box.
-                lbl.setText(f"[→]  {talent}")
+                lbl.setText(f"[→]  {pre}{talent}")
                 lbl.setStyleSheet("color: #ffdd44;")
             else:
-                lbl.setText(f"[✗]  {talent}")
+                lbl.setText(f"[✗]  {pre}{talent}")
                 lbl.setStyleSheet("color: #fc5d5d;")
+            lbl.setVisible(not search_text or search_text in talent.lower())
 
     def _reset_owned(self) -> None:
         """Clear all persisted owned-talent marks and refresh the UI."""
@@ -657,6 +840,25 @@ class OverlayWindow(QWidget):
         if self._card_highlight:
             self._card_highlight.clear()
         log.info("Owned talents reset")
+
+    def _toggle_debug_ocr(self) -> None:
+        """Toggle debug_ocr_highlight in config and update button appearance."""
+        cfg = load_config()
+        enabled = not cfg.get("debug_ocr_highlight", False)
+        cfg["debug_ocr_highlight"] = enabled
+        save_config(cfg)
+        if enabled:
+            self._debug_btn.setText("🔍 OCR Debug: ON")
+            self._debug_btn.setStyleSheet(
+                "background-color:#2a1a3a; color:#cc88ff;"
+                " border:1px solid #664488; border-radius:4px; padding:4px 10px; font-size:11px;"
+            )
+        else:
+            self._debug_btn.setText("🔍 OCR Debug: OFF")
+            self._debug_btn.setStyleSheet("")  # reset to stylesheet default
+            if self._card_highlight:
+                self._card_highlight.clear_debug()
+        log.info("debug_ocr_highlight set to %s", enabled)
 
     @pyqtSlot(str)
     def mark_talent_picked(self, talent: str) -> None:
@@ -673,7 +875,8 @@ class OverlayWindow(QWidget):
         save_config(cfg)
         lbl = self._talent_labels.get(talent)
         if lbl:
-            lbl.setText(f"[✓]  {talent}")
+            pre = "⚑ " if talent in self._pre_shrine_talents else ""
+            lbl.setText(f"[✓]  {pre}{talent}")
             lbl.setStyleSheet("color: #5dfc8a;")
         log.info("Talent picked and marked as owned: '%s'", talent)
 
@@ -701,19 +904,61 @@ class OverlayWindow(QWidget):
         dlg = DiagDialog(self, self._card_highlight)
         dlg.exec_()
 
-    # --- Drag support ---
+    # --- Drag-to-move and resize-grip support ---
+    _GRIP = 14  # px — size of the resize corner hit area
+
+    def _in_grip(self, pos) -> bool:
+        """Return True when pos is inside the bottom-right resize corner."""
+        r = self.rect()
+        return (pos.x() >= r.width()  - self._GRIP and
+                pos.y() >= r.height() - self._GRIP)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            if self._in_grip(event.pos()):
+                self._resize_start_global = event.globalPos()
+                self._resize_start_size   = self.size()
+                self._drag_pos = None
+            else:
+                self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+                self._resize_start_global = None
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self._drag_pos is not None:
-            self.move(event.globalPos() - self._drag_pos)
-            event.accept()
+        if event.buttons() == Qt.LeftButton:
+            if getattr(self, "_resize_start_global", None) is not None:
+                delta = event.globalPos() - self._resize_start_global
+                new_w = max(200, self._resize_start_size.width()  + delta.x())
+                new_h = max(150, self._resize_start_size.height() + delta.y())
+                self.resize(new_w, new_h)
+            elif self._drag_pos is not None:
+                self.move(event.globalPos() - self._drag_pos)
+        # Update cursor to show resize arrow when hovering the grip corner
+        if self._in_grip(event.pos()):
+            self.setCursor(Qt.SizeFDiagCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        event.accept()
 
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
+        self._resize_start_global = None
+
+    def paintEvent(self, event):
+        """Draw a small resize-grip triangle in the bottom-right corner."""
+        super().paintEvent(event)
+        from PyQt5.QtGui import QPainter, QColor, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = self._GRIP
+        w, h = self.width(), self.height()
+        # Draw three diagonal lines as a classic grip indicator
+        col = QColor(120, 120, 160, 160)
+        pen = QPen(col, 1)
+        p.setPen(pen)
+        for offset in (4, 8, 12):
+            p.drawLine(w - offset, h - 2, w - 2, h - offset)
+        p.end()
 
 
 # ---------------------------------------------------------------------------

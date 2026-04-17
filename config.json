@@ -1,26 +1,240 @@
 {
   "ocr_regions": [
-    {"x": 283, "y": 235, "w": 158, "h": 42},
-    {"x": 451, "y": 235, "w": 158, "h": 42},
-    {"x": 618, "y": 235, "w": 158, "h": 42},
-    {"x": 786, "y": 235, "w": 158, "h": 42},
-    {"x": 954, "y": 235, "w": 158, "h": 42}
+    {
+      "x": 627,
+      "y": 321,
+      "w": 204,
+      "h": 294
+    },
+    {
+      "x": 855,
+      "y": 321,
+      "w": 207,
+      "h": 293
+    },
+    {
+      "x": 1086,
+      "y": 321,
+      "w": 206,
+      "h": 293
+    }
   ],
-  "num_cards": 5,
-  "name_strip_region": null,
-  "talents_panel_region": {"x": 1060, "y": 100, "w": 300, "h": 650},
+  "name_strip_region": {
+    "x": 404,
+    "y": 327,
+    "w": 1112,
+    "h": 36
+  },
+  "talents_panel_region": {
+    "x": 1479,
+    "y": 80,
+    "w": 425,
+    "h": 883
+  },
   "ocr_interval_ms": 1000,
   "fuzzy_threshold": 72,
-  "owned_fuzzy_threshold": 60,
+  "owned_fuzzy_threshold": 75,
   "card_highlight_above": 30,
   "card_highlight_below": 185,
-  "debug_images": false,
-  "debug_max_files": 20,
+  "debug_images": true,
   "debug_zorder": false,
   "hotkey_toggle": "F6",
   "hotkey_scan_owned": "F7",
   "hotkey_diag": "F8",
   "hotkey_reset_owned": "F9",
-  "known_owned_talents": [],
-  "last_url": ""
+  "known_owned_talents": [
+    "Against All Odds",
+    "Armor Conserver",
+    "Battle Tendency",
+    "Bear Trap",
+    "Berserk",
+    "Blade Dancer",
+    "Bloodiron Spirit",
+    "Braced Collapse",
+    "Brassneck",
+    "Breathing Exercise",
+    "Broken Ankles",
+    "Carnivore",
+    "Champion's Regalia",
+    "Chaotic Charm",
+    "Charged Return",
+    "Charismatic Cast",
+    "Chronostasis",
+    "Concussion",
+    "Dazing Finisher",
+    "Decisive Blow",
+    "Defiance",
+    "Disbelief",
+    "Emergency Reserves",
+    "Endurance Runner",
+    "Exoskeleton",
+    "Fishman",
+    "Golden Tongue",
+    "Gourmand",
+    "Grand Feast",
+    "Knife's Journey",
+    "Last Resort",
+    "Lasting Charisma",
+    "Lightweight",
+    "Lose Your Mind",
+    "Manipulator",
+    "Matador",
+    "Nullifying Clarity",
+    "Old Habits Die Hard",
+    "Padded Armor",
+    "Piercing Will",
+    "Precise Swing",
+    "Replenishing Knockout",
+    "Safety Dance",
+    "Shield Breaker",
+    "Showstopper",
+    "Snake Oil",
+    "Speed Demon",
+    "Spine Cutter",
+    "Spinning Swordsman",
+    "Steel Scales",
+    "Successive Throw",
+    "Swift Rebound",
+    "Thresher Claws",
+    "Tough Love",
+    "Underdog",
+    "Unnecessary Theatrics",
+    "Unswayed",
+    "Unwavering Resolve",
+    "Wyvern's Claw [LHT]"
+  ],
+  "last_url": "https://deepwoken.co/builder?id=KBNstowa",
+  "ocr_region_sets": {
+    "5": [
+      {
+        "x": 399,
+        "y": 322,
+        "w": 203,
+        "h": 292
+      },
+      {
+        "x": 624,
+        "y": 322,
+        "w": 210,
+        "h": 291
+      },
+      {
+        "x": 856,
+        "y": 320,
+        "w": 206,
+        "h": 295
+      },
+      {
+        "x": 1084,
+        "y": 322,
+        "w": 207,
+        "h": 294
+      },
+      {
+        "x": 1314,
+        "y": 323,
+        "w": 207,
+        "h": 294
+      }
+    ],
+    "6": [
+      {
+        "x": 284,
+        "y": 319,
+        "w": 206,
+        "h": 296
+      },
+      {
+        "x": 513,
+        "y": 319,
+        "w": 205,
+        "h": 297
+      },
+      {
+        "x": 740,
+        "y": 320,
+        "w": 205,
+        "h": 295
+      },
+      {
+        "x": 973,
+        "y": 321,
+        "w": 205,
+        "h": 295
+      },
+      {
+        "x": 1201,
+        "y": 320,
+        "w": 205,
+        "h": 295
+      },
+      {
+        "x": 1430,
+        "y": 322,
+        "w": 206,
+        "h": 291
+      }
+    ],
+    "4": [
+      {
+        "x": 0,
+        "y": 0,
+        "w": 158,
+        "h": 42
+      },
+      {
+        "x": 0,
+        "y": 0,
+        "w": 158,
+        "h": 42
+      },
+      {
+        "x": 0,
+        "y": 0,
+        "w": 158,
+        "h": 42
+      },
+      {
+        "x": 0,
+        "y": 0,
+        "w": 158,
+        "h": 42
+      }
+    ],
+    "3": [
+      {
+        "x": 627,
+        "y": 321,
+        "w": 204,
+        "h": 294
+      },
+      {
+        "x": 855,
+        "y": 321,
+        "w": 207,
+        "h": 293
+      },
+      {
+        "x": 1086,
+        "y": 321,
+        "w": 206,
+        "h": 293
+      }
+    ]
+  },
+  "debug_ocr_highlight": false,
+  "card_detect_region": {
+    "x": 220,
+    "y": 307,
+    "w": 1437,
+    "h": 318
+  },
+  "card_detect_hsv": {
+    "h_lo": 12,
+    "h_hi": 38,
+    "s_lo": 80,
+    "s_hi": 255,
+    "v_lo": 90,
+    "v_hi": 255
+  }
 }
